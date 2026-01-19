@@ -601,7 +601,9 @@ def run_single_comparison(
     concentration: float = 1.0,
     covariance_type: str = 'full',  # Full covariance for DP
     seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    dp_only: bool = False,  # Run only DP (CPU)
+    pyp_only: bool = False,  # Run only PYP (GPU)
 ) -> Dict[str, Any]:
     """
     Run a single head-to-head comparison of DP vs PYP.
@@ -627,25 +629,36 @@ def run_single_comparison(
     if verbose:
         print(f"      Cluster sizes: {dataset.size_distribution_summary()}")
 
-    # Fit DP
-    if verbose:
-        print(f"\n[2/4] Fitting Dirichlet Process (sklearn, cov={covariance_type})...")
-    result_dp = fit_dirichlet_process(
-        dataset.X,
-        max_components=max_components,
-        concentration=concentration,
-        covariance_type=covariance_type
-    )
-    eval_dp = evaluate_clustering(
-        dataset.X, dataset.y_true, result_dp.labels,
-        n_true_clusters, result_dp.k_inferred
-    )
-    if verbose:
-        print(f"      K_inferred={result_dp.k_inferred}, NMI={eval_dp.nmi:.4f}, "
-              f"ARI={eval_dp.ari:.4f}, Time={result_dp.elapsed_time:.1f}s")
+    # Fit DP (skip if pyp_only)
+    result_dp = None
+    eval_dp = None
+    if not pyp_only:
+        if verbose:
+            print(f"\n[2/4] Fitting Dirichlet Process (sklearn, cov={covariance_type})...")
+        result_dp = fit_dirichlet_process(
+            dataset.X,
+            max_components=max_components,
+            concentration=concentration,
+            covariance_type=covariance_type
+        )
+        eval_dp = evaluate_clustering(
+            dataset.X, dataset.y_true, result_dp.labels,
+            n_true_clusters, result_dp.k_inferred
+        )
+        if verbose:
+            print(f"      K_inferred={result_dp.k_inferred}, NMI={eval_dp.nmi:.4f}, "
+                  f"ARI={eval_dp.ari:.4f}, Time={result_dp.elapsed_time:.1f}s")
+    else:
+        if verbose:
+            print("\n[2/4] Skipping DP (--pyp_only mode)")
 
-    # Fit PYP
-    if PYRO_AVAILABLE:
+    # Fit PYP (skip if dp_only)
+    if dp_only:
+        if verbose:
+            print("\n[3/4] Skipping PYP (--dp_only mode)")
+        result_pyp = None
+        eval_pyp = None
+    elif PYRO_AVAILABLE:
         if verbose:
             print(f"\n[3/4] Fitting Pitman-Yor Process (Pyro on {GPU_NAME}, TUNED)...")
         result_pyp = fit_pitman_yor_gpu(
@@ -676,7 +689,8 @@ def run_single_comparison(
         print("\n[4/4] Summary")
         print("-" * 50)
         print(f"True K: {n_true_clusters}")
-        print(f"DP  inferred K: {result_dp.k_inferred} (error: {eval_dp.k_error})")
+        if result_dp:
+            print(f"DP  inferred K: {result_dp.k_inferred} (error: {eval_dp.k_error})")
         if eval_pyp:
             print(f"PYP inferred K: {result_pyp.k_inferred} (error: {eval_pyp.k_error})")
             print(f"\nNMI: DP={eval_dp.nmi:.4f}, PYP={eval_pyp.nmi:.4f}")
@@ -699,15 +713,15 @@ def run_single_comparison(
             'cluster_sizes': dataset.cluster_sizes.tolist()
         },
         'dp': {
-            'k_inferred': result_dp.k_inferred,
-            'time': result_dp.elapsed_time,
-            **eval_dp.to_dict()
-        },
+            'k_inferred': result_dp.k_inferred if result_dp else None,
+            'time': result_dp.elapsed_time if result_dp else None,
+            **(eval_dp.to_dict() if eval_dp else {})
+        } if result_dp else None,
         'pyp': {
             'k_inferred': result_pyp.k_inferred if result_pyp else None,
             'time': result_pyp.elapsed_time if result_pyp else None,
             **(eval_pyp.to_dict() if eval_pyp else {})
-        } if PYRO_AVAILABLE else None
+        } if result_pyp else None
     }
 
 
@@ -719,7 +733,9 @@ def run_separation_sweep(
     zipf_exponent: float = 2.0,
     elliptical: bool = True,
     seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    dp_only: bool = False,
+    pyp_only: bool = False,
 ) -> pd.DataFrame:
     """
     Find the crossover point where PYP beats DP.
@@ -743,7 +759,9 @@ def run_separation_sweep(
             cluster_separation=sep,
             elliptical=elliptical,
             seed=seed,
-            verbose=verbose
+            verbose=verbose,
+            dp_only=dp_only,
+            pyp_only=pyp_only,
         )
 
         row = {
@@ -752,17 +770,17 @@ def run_separation_sweep(
             'n_samples': n_samples,
             'elliptical': elliptical,
             'k_true': n_true_clusters,
-            'k_dp': result['dp']['k_inferred'],
+            'k_dp': result['dp']['k_inferred'] if result['dp'] else None,
             'k_pyp': result['pyp']['k_inferred'] if result['pyp'] else None,
-            'nmi_dp': result['dp']['NMI'],
+            'nmi_dp': result['dp']['NMI'] if result['dp'] else None,
             'nmi_pyp': result['pyp']['NMI'] if result['pyp'] else None,
-            'ari_dp': result['dp']['ARI'],
+            'ari_dp': result['dp']['ARI'] if result['dp'] else None,
             'ari_pyp': result['pyp']['ARI'] if result['pyp'] else None,
-            'time_dp': result['dp']['time'],
+            'time_dp': result['dp']['time'] if result['dp'] else None,
             'time_pyp': result['pyp']['time'] if result['pyp'] else None,
         }
 
-        if result['pyp'] and result['pyp']['NMI'] and result['dp']['NMI'] > 0:
+        if result['pyp'] and result['dp'] and result['pyp']['NMI'] and result['dp']['NMI'] > 0:
             row['nmi_improvement'] = (row['nmi_pyp'] - row['nmi_dp']) / row['nmi_dp'] * 100
             row['ari_improvement'] = (row['ari_pyp'] - row['ari_dp']) / (row['ari_dp'] + 1e-10) * 100
             row['k_error_dp'] = abs(row['k_dp'] - n_true_clusters)
@@ -970,6 +988,10 @@ Examples:
                         help='Output CSV file')
     parser.add_argument('--quiet', action='store_true',
                         help='Minimal output')
+    parser.add_argument('--dp_only', action='store_true',
+                        help='Run only DP (sklearn, CPU) - for local machine')
+    parser.add_argument('--pyp_only', action='store_true',
+                        help='Run only PYP (Pyro, GPU) - for cloud GPU')
 
     args = parser.parse_args()
 
@@ -1001,7 +1023,9 @@ Examples:
             zipf_exponent=args.zipf_exponent,
             elliptical=elliptical,
             seed=args.seed,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            dp_only=args.dp_only,
+            pyp_only=args.pyp_only,
         )
 
         if args.output:
