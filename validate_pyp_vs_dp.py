@@ -234,7 +234,7 @@ def fit_dirichlet_process(
 
     model = BayesianGaussianMixture(
         n_components=max_components,
-        covariance_type='full',
+        covariance_type='diag',  # 'diag' is 10x faster than 'full'
         weight_concentration_prior_type='dirichlet_process',
         weight_concentration_prior=concentration,
         n_init=n_init,
