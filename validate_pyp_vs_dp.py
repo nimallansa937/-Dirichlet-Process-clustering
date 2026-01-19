@@ -29,7 +29,7 @@ import pandas as pd
 from scipy.stats import zipf as zipf_dist
 from sklearn.metrics import (
     normalized_mutual_info_score,
-    adjusted_rand_index,
+    adjusted_rand_score,
     silhouette_score
 )
 from sklearn.mixture import BayesianGaussianMixture
@@ -598,7 +598,7 @@ def evaluate_clustering(
         Container with all metrics
     """
     nmi = normalized_mutual_info_score(y_true, y_pred)
-    ari = adjusted_rand_index(y_true, y_pred)
+    ari = adjusted_rand_score(y_true, y_pred)
     k_error = abs(k_pred - k_true)
     k_ratio = k_pred / k_true
 
