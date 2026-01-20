@@ -796,27 +796,46 @@ def run_separation_sweep(
         print("\n" + "=" * 70)
         print("SEPARATION SWEEP SUMMARY")
         print("=" * 70)
-        print("\n| Separation | DP NMI | PYP NMI | Winner | NMI Δ |")
-        print("|------------|--------|---------|--------|-------|")
-        for _, row in df.iterrows():
-            winner = "PYP" if row.get('pyp_wins', False) else "DP"
-            delta = row.get('nmi_improvement', 0)
-            print(f"| {row['separation']:.1f}        | {row['nmi_dp']:.4f} | {row['nmi_pyp']:.4f}  | {winner}    | {delta:+.1f}% |")
 
-        # Find crossover point
-        crossover = None
-        for _, row in df.iterrows():
-            if row.get('pyp_wins', False):
-                crossover = row['separation']
-                break
+        # Check what data we have
+        has_dp = df['nmi_dp'].notna().any()
+        has_pyp = df['nmi_pyp'].notna().any()
 
-        print("\n" + "=" * 70)
-        if crossover:
-            print(f"✅ CROSSOVER FOUND: PYP beats DP at separation ≤ {crossover}")
-            print("   PYP advantage confirmed for hard clustering problems")
-        else:
-            print("❌ NO CROSSOVER: DP wins at all tested separations")
-            print("   PYP advantage not observed in this configuration")
+        if has_dp and has_pyp:
+            print("\n| Separation | DP NMI | PYP NMI | Winner | NMI Δ |")
+            print("|------------|--------|---------|--------|-------|")
+            for _, row in df.iterrows():
+                winner = "PYP" if row.get('pyp_wins', False) else "DP"
+                delta = row.get('nmi_improvement', 0) or 0
+                print(f"| {row['separation']:.1f}        | {row['nmi_dp']:.4f} | {row['nmi_pyp']:.4f}  | {winner}    | {delta:+.1f}% |")
+        elif has_dp:
+            print("\n| Separation | DP K | DP NMI | DP ARI | Time (s) |")
+            print("|------------|------|--------|--------|----------|")
+            for _, row in df.iterrows():
+                print(f"| {row['separation']:.1f}        | {row['k_dp']}   | {row['nmi_dp']:.4f} | {row['ari_dp']:.4f} | {row['time_dp']:.0f}     |")
+            print("\n(DP only mode - run --pyp_only on GPU for comparison)")
+        elif has_pyp:
+            print("\n| Separation | PYP K | PYP NMI | PYP ARI | Time (s) |")
+            print("|------------|-------|---------|---------|----------|")
+            for _, row in df.iterrows():
+                print(f"| {row['separation']:.1f}        | {row['k_pyp']}    | {row['nmi_pyp']:.4f}  | {row['ari_pyp']:.4f}  | {row['time_pyp']:.0f}     |")
+            print("\n(PYP only mode - merge with DP results for comparison)")
+
+        # Find crossover point (only if both have data)
+        if has_dp and has_pyp:
+            crossover = None
+            for _, row in df.iterrows():
+                if row.get('pyp_wins', False):
+                    crossover = row['separation']
+                    break
+
+            print("\n" + "=" * 70)
+            if crossover:
+                print(f"✅ CROSSOVER FOUND: PYP beats DP at separation ≤ {crossover}")
+                print("   PYP advantage confirmed for hard clustering problems")
+            else:
+                print("❌ NO CROSSOVER: DP wins at all tested separations")
+                print("   PYP advantage not observed in this configuration")
 
     return df
 
