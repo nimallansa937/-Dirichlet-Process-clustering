@@ -693,14 +693,17 @@ def run_single_comparison(
             print(f"DP  inferred K: {result_dp.k_inferred} (error: {eval_dp.k_error})")
         if eval_pyp:
             print(f"PYP inferred K: {result_pyp.k_inferred} (error: {eval_pyp.k_error})")
-            print(f"\nNMI: DP={eval_dp.nmi:.4f}, PYP={eval_pyp.nmi:.4f}")
-            if eval_dp.nmi > 0:
-                nmi_improvement = (eval_pyp.nmi - eval_dp.nmi) / eval_dp.nmi * 100
-                print(f"NMI improvement: {nmi_improvement:+.1f}%")
-            print(f"\nARI: DP={eval_dp.ari:.4f}, PYP={eval_pyp.ari:.4f}")
-            if eval_dp.ari > 0:
-                ari_improvement = (eval_pyp.ari - eval_dp.ari) / (eval_dp.ari + 1e-10) * 100
-                print(f"ARI improvement: {ari_improvement:+.1f}%")
+            if eval_dp:
+                print(f"\nNMI: DP={eval_dp.nmi:.4f}, PYP={eval_pyp.nmi:.4f}")
+                if eval_dp.nmi > 0:
+                    nmi_improvement = (eval_pyp.nmi - eval_dp.nmi) / eval_dp.nmi * 100
+                    print(f"NMI improvement: {nmi_improvement:+.1f}%")
+                print(f"\nARI: DP={eval_dp.ari:.4f}, PYP={eval_pyp.ari:.4f}")
+                if eval_dp.ari > 0:
+                    ari_improvement = (eval_pyp.ari - eval_dp.ari) / (eval_dp.ari + 1e-10) * 100
+                    print(f"ARI improvement: {ari_improvement:+.1f}%")
+            else:
+                print(f"\nPYP NMI: {eval_pyp.nmi:.4f}, ARI: {eval_pyp.ari:.4f}")
 
     return {
         'dataset': {
