@@ -35,6 +35,8 @@ from sklearn.metrics import (
 )
 from sklearn.mixture import BayesianGaussianMixture
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
 # Suppress sklearn convergence warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -287,49 +289,91 @@ def fit_pitman_yor_gpu(
     max_components: int = 100,
     discount: float = 0.25,
     concentration: float = 1.0,
-    n_steps: int = 2000,  # Increased from 1000
-    learning_rate: float = 0.005,  # Reduced from 0.01
+    n_steps: int = 3000,
+    learning_rate: float = 0.01,
     batch_size: Optional[int] = None,
-    use_kmeans_init: bool = True,  # K-means initialization
-    verbose: bool = True
+    use_kmeans_init: bool = True,
+    verbose: bool = True,
+    pca_components: Optional[int] = None,  # Auto PCA for high-dim data
 ) -> ClusteringResult:
     """
     Fit Pitman-Yor Process Mixture Model using variational inference on GPU.
 
-    TUNED VERSION with:
-    - K-means initialization for better starting point
-    - More SVI steps (2000)
-    - Lower learning rate (0.005)
-    - Full covariance support
+    FIXED VERSION with:
+    - PCA dimensionality reduction for high-dim data
+    - MixtureSameFamily for proper marginalization (no discrete latent issues)
+    - Better hyperparameter defaults
+    - Standardization for numerical stability
     """
     if not PYRO_AVAILABLE:
         raise ImportError("Pyro not available. Install with: pip install pyro-ppl")
 
     pyro.clear_param_store()
 
-    X_tensor = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+    start = time.time()
+    N_orig, D_orig = X.shape
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PREPROCESSING: Standardization + PCA for high-dimensional data
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Standardize data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Apply PCA if high-dimensional
+    pca = None
+    if pca_components is None and D_orig > 20:
+        pca_components = min(20, N_orig - 1, D_orig)
+
+    if pca_components is not None and pca_components < D_orig:
+        pca = PCA(n_components=pca_components)
+        X_reduced = pca.fit_transform(X_scaled)
+        explained_var = pca.explained_variance_ratio_.sum()
+        if verbose:
+            print(f"  PCA: {D_orig}D -> {pca_components}D (explained variance: {explained_var:.1%})")
+    else:
+        X_reduced = X_scaled
+
+    X_tensor = torch.tensor(X_reduced, dtype=torch.float32, device=DEVICE)
     N, D = X_tensor.shape
     K = max_components
 
-    start = time.time()
-
-    # K-means initialization for better starting point
-    if use_kmeans_init and verbose:
-        print("  Initializing with K-means...")
+    # ─────────────────────────────────────────────────────────────────────────
+    # K-MEANS INITIALIZATION - use more clusters for better coverage
+    # ─────────────────────────────────────────────────────────────────────────
 
     if use_kmeans_init:
-        kmeans = KMeans(n_clusters=min(K, 50), random_state=42, n_init=3)
-        kmeans.fit(X[:min(10000, N)])  # Use subset for speed
+        if verbose:
+            print(f"  K-means init with {min(K, 50)} clusters...")
+        kmeans = KMeans(n_clusters=min(K, 50), random_state=42, n_init=10, max_iter=300)
+        kmeans.fit(X_reduced[:min(20000, N)])
         init_centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32, device=DEVICE)
-        # Pad with random centers if needed
+
+        # Compute initial scales from kmeans clusters
+        init_scales = []
+        for i in range(min(K, 50)):
+            mask = kmeans.labels_ == i
+            if mask.sum() > 1:
+                std = np.std(X_reduced[:min(20000, N)][mask], axis=0) + 0.1
+            else:
+                std = np.ones(D) * 0.5
+            init_scales.append(std)
+        init_scales = torch.tensor(np.array(init_scales), dtype=torch.float32, device=DEVICE)
+
+        # Pad with perturbed centers if needed
         if K > 50:
-            extra_centers = torch.randn(K - 50, D, device=DEVICE) * 2
+            extra_idx = np.random.choice(50, K - 50)
+            extra_centers = init_centers[extra_idx] + torch.randn(K - 50, D, device=DEVICE) * 0.5
             init_centers = torch.cat([init_centers, extra_centers], dim=0)
+            extra_scales = init_scales[extra_idx] * (0.8 + 0.4 * torch.rand(K - 50, D, device=DEVICE))
+            init_scales = torch.cat([init_scales, extra_scales], dim=0)
     else:
-        init_centers = torch.randn(K, D, device=DEVICE) * 2
+        init_centers = torch.randn(K, D, device=DEVICE)
+        init_scales = torch.ones(K, D, device=DEVICE) * 0.5
 
     # ─────────────────────────────────────────────────────────────────────────
-    # MODEL: Pitman-Yor Process with stick-breaking construction
+    # MODEL: PYP with stick-breaking + MixtureSameFamily (marginalizes assignments)
     # ─────────────────────────────────────────────────────────────────────────
 
     def model(X_batch):
@@ -350,13 +394,17 @@ def fit_pitman_yor_gpu(
         weights[:K-1] = v * cumprod_shifted
         weights[K-1] = cumprod[-1]
 
-        # Cluster parameters with wider priors
+        # Add small epsilon for numerical stability
+        weights = weights + 1e-8
+        weights = weights / weights.sum()
+
+        # Cluster parameters
         with pyro.plate('components', K):
             locs = pyro.sample(
                 'locs',
                 dist.Normal(
                     torch.zeros(D, device=DEVICE),
-                    torch.ones(D, device=DEVICE) * 3.0  # Wider prior
+                    torch.ones(D, device=DEVICE) * 5.0
                 ).to_event(1)
             )
             scales = pyro.sample(
@@ -367,51 +415,49 @@ def fit_pitman_yor_gpu(
                 ).to_event(1)
             )
 
+        # Use MixtureSameFamily to marginalize over assignments analytically
+        mix = dist.Categorical(weights)
+        comp = dist.Normal(locs, scales).to_event(1)
+        gmm = dist.MixtureSameFamily(mix, comp)
+
         with pyro.plate('data', batch_size):
-            assignment = pyro.sample('assignment', dist.Categorical(weights))
-            pyro.sample(
-                'obs',
-                dist.Normal(locs[assignment], scales[assignment]).to_event(1),
-                obs=X_batch
-            )
+            pyro.sample('obs', gmm, obs=X_batch)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # GUIDE: Mean-field variational approximation with K-means init
+    # GUIDE: Mean-field with good initialization
     # ─────────────────────────────────────────────────────────────────────────
 
     def guide(X_batch):
+        # Initialize stick-breaking to encourage more clusters early
         v_alpha = pyro.param(
             'v_alpha',
-            torch.ones(K - 1, device=DEVICE) * 1.5,
+            torch.ones(K - 1, device=DEVICE) * 2.0,
             constraint=dist.constraints.positive
         )
         v_beta = pyro.param(
             'v_beta',
-            torch.ones(K - 1, device=DEVICE) * 0.5,
+            torch.ones(K - 1, device=DEVICE) * 1.0,
             constraint=dist.constraints.positive
         )
 
         with pyro.plate('sticks', K - 1):
             pyro.sample('v', dist.Beta(v_alpha, v_beta))
 
-        # Initialize locations with K-means centers
-        loc_mean = pyro.param(
-            'loc_mean',
-            init_centers.clone()
-        )
+        loc_mean = pyro.param('loc_mean', init_centers.clone())
         loc_scale = pyro.param(
             'loc_scale',
-            torch.ones(K, D, device=DEVICE) * 0.3,
+            torch.ones(K, D, device=DEVICE) * 0.1,
             constraint=dist.constraints.positive
         )
 
+        # Initialize scale parameters from kmeans
         scale_loc = pyro.param(
             'scale_loc',
-            torch.zeros(K, D, device=DEVICE)
+            torch.log(init_scales.clamp(min=0.1))
         )
         scale_scale = pyro.param(
             'scale_scale',
-            torch.ones(K, D, device=DEVICE) * 0.2,
+            torch.ones(K, D, device=DEVICE) * 0.1,
             constraint=dist.constraints.positive
         )
 
@@ -420,34 +466,26 @@ def fit_pitman_yor_gpu(
             pyro.sample('scales', dist.LogNormal(scale_loc, scale_scale).to_event(1))
 
     # ─────────────────────────────────────────────────────────────────────────
-    # SVI OPTIMIZATION with learning rate schedule
+    # SVI OPTIMIZATION
     # ─────────────────────────────────────────────────────────────────────────
 
     optimizer = ClippedAdam({
         'lr': learning_rate,
         'clip_norm': 10.0,
-        'betas': (0.9, 0.999)
+        'betas': (0.9, 0.999),
+        'lrd': 0.9999  # Learning rate decay
     })
     elbo = Trace_ELBO()
     svi = SVI(model, guide, optimizer, loss=elbo)
 
     losses = []
-    best_loss = float('inf')
-    patience_counter = 0
 
     if batch_size is None or batch_size >= N:
         for step in range(n_steps):
             loss = svi.step(X_tensor)
             losses.append(loss)
 
-            # Track best loss
-            if loss < best_loss:
-                best_loss = loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if verbose and (step + 1) % 400 == 0:
+            if verbose and (step + 1) % 500 == 0:
                 print(f"  Step {step + 1}/{n_steps}: ELBO loss = {loss:.2f}")
     else:
         n_batches = (N + batch_size - 1) // batch_size
@@ -463,7 +501,7 @@ def fit_pitman_yor_gpu(
 
             losses.append(epoch_loss / n_batches)
 
-            if verbose and (step + 1) % 400 == 0:
+            if verbose and (step + 1) % 500 == 0:
                 print(f"  Step {step + 1}/{n_steps}: ELBO loss = {losses[-1]:.2f}")
 
     elapsed = time.time() - start
@@ -498,7 +536,7 @@ def fit_pitman_yor_gpu(
             X_chunk = X_tensor[i:i + chunk_size]
             diff = X_chunk.unsqueeze(1) - loc_mean.unsqueeze(0)
             log_probs = -0.5 * ((diff / scales_mean.unsqueeze(0)) ** 2).sum(dim=2)
-            log_probs = log_probs - D * torch.log(scales_mean).sum(dim=1).unsqueeze(0)
+            log_probs = log_probs - torch.log(scales_mean).sum(dim=1).unsqueeze(0)
             log_posterior = log_probs + log_weights.unsqueeze(0)
             chunk_labels = log_posterior.argmax(dim=1)
             labels_list.append(chunk_labels.cpu().numpy())
@@ -523,7 +561,9 @@ def fit_pitman_yor_gpu(
             'final_loss': losses[-1] if losses else None,
             'n_active_components': len(active_weights),
             'weight_distribution': sorted(weights_np[weights_np > 0.001], reverse=True)[:10],
-            'kmeans_init': use_kmeans_init
+            'kmeans_init': use_kmeans_init,
+            'pca_components': pca_components if pca else None,
+            'pca_explained_var': pca.explained_variance_ratio_.sum() if pca else None,
         }
     )
 
@@ -1104,27 +1144,29 @@ Examples:
             verbose=not args.quiet
         )
 
-        if result['pyp'] and result['pyp']['NMI']:
-            dp_nmi = result['dp']['NMI']
+        if result['pyp'] and result['pyp']['NMI'] is not None:
             pyp_nmi = result['pyp']['NMI']
+            dp_nmi = result['dp']['NMI'] if result.get('dp') else None
 
             print("\n" + "=" * 70)
-            print("🔍 CONCLUSION")
+            print("CONCLUSION")
             print("=" * 70)
 
-            if dp_nmi > 0:
+            if dp_nmi is not None and dp_nmi > 0:
                 nmi_improvement = (pyp_nmi - dp_nmi) / dp_nmi * 100
 
                 if nmi_improvement >= 10:
-                    print(f"✅ PYP shows significant improvement ({nmi_improvement:.1f}%)")
+                    print(f"PYP shows significant improvement ({nmi_improvement:.1f}%)")
                     print("   Reports VALIDATED for this configuration")
                 elif nmi_improvement >= 0:
-                    print(f"⚠️  PYP shows modest improvement ({nmi_improvement:.1f}%)")
+                    print(f"PYP shows modest improvement ({nmi_improvement:.1f}%)")
                 else:
-                    print(f"❌ DP outperforms PYP ({nmi_improvement:.1f}%)")
+                    print(f"DP outperforms PYP ({nmi_improvement:.1f}%)")
                     print("   Reports NOT validated for this configuration")
             else:
-                print(f"PYP NMI: {pyp_nmi:.4f}, DP NMI: {dp_nmi:.4f}")
+                print(f"PYP NMI: {pyp_nmi:.4f}")
+                if dp_nmi is None:
+                    print("   (DP was skipped - run without --pyp_only for comparison)")
 
 
 if __name__ == '__main__':
