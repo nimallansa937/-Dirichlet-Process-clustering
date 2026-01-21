@@ -1141,7 +1141,9 @@ Examples:
             pyp_discount=args.discount,
             concentration=args.concentration,
             seed=args.seed,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            dp_only=args.dp_only,
+            pyp_only=args.pyp_only
         )
 
         if result['pyp'] and result['pyp']['NMI'] is not None:
